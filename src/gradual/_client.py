@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from typing import Any, TypeVar, overload
 
 import httpx
+import websockets
+import websockets.sync.client
 
 from ._evaluator import evaluate_flag
 from ._event_buffer import EventBuffer
@@ -244,6 +246,12 @@ class GradualClient:
         self._polling_enabled = options.polling_enabled
         self._polling_interval_ms = options.polling_interval_ms
         self._polling_timer: threading.Timer | None = None
+        self._realtime_enabled = options.realtime_enabled
+        self._ws: websockets.sync.client.ClientConnection | None = None
+        self._ws_thread: threading.Thread | None = None
+        self._ws_reconnect_timer: threading.Timer | None = None
+        self._ws_reconnect_attempt = 0
+        self._stopped = False
         self._ready_event = threading.Event()
         self._http = httpx.Client(timeout=30)
         self._init_error: Exception | None = None
@@ -270,8 +278,14 @@ class GradualClient:
             if data.get("mauLimitReached"):
                 self._mau_limit_reached = True
 
-            self._fetch_snapshot()
-            self._start_polling()
+            ws_connected = False
+            if self._realtime_enabled:
+                ws_connected = self._try_ws_init()
+
+            if not ws_connected:
+                self._fetch_snapshot()
+                self._start_polling()
+
             self._initialize_event_buffer()
         except Exception as e:
             self._init_error = e
@@ -320,6 +334,144 @@ class GradualClient:
 
         self._snapshot = _parse_snapshot(resp.json())
 
+    def _build_ws_url(self) -> str:
+        """Build WebSocket URL from base URL."""
+        url = self._base_url
+        if url.startswith("https://"):
+            url = "wss://" + url[len("https://"):]
+        elif url.startswith("http://"):
+            url = "ws://" + url[len("http://"):]
+        return f"{url}/sdk/connect?apiKey={self._api_key}&environment={self._environment}"
+
+    def _try_ws_init(self) -> bool:
+        """Try to connect via WebSocket and receive initial snapshot.
+
+        Returns True if the initial snapshot was received successfully,
+        False if connection failed and caller should fall back to polling.
+        """
+        try:
+            ws_url = self._build_ws_url()
+            ws = websockets.sync.client.connect(ws_url, open_timeout=10)
+            # Read the first message as the initial snapshot
+            raw = ws.recv(timeout=10)
+            data = json.loads(raw)
+            self._snapshot = _parse_snapshot(data)
+            self._ws = ws
+            self._ws_reconnect_attempt = 0
+            # Start background thread to listen for updates
+            self._ws_thread = threading.Thread(
+                target=self._ws_listen_loop, daemon=True
+            )
+            self._ws_thread.start()
+            logger.debug("Gradual: WebSocket connected")
+            return True
+        except Exception as e:
+            logger.warning(
+                "Gradual: WebSocket connection failed, falling back to polling: %s", e
+            )
+            return False
+
+    def _ws_listen_loop(self) -> None:
+        """Background thread that listens for WebSocket messages."""
+        try:
+            ws = self._ws
+            if ws is None:
+                return
+            for raw in ws:
+                if self._stopped:
+                    return
+                try:
+                    data = json.loads(raw)
+                    new_snapshot = _parse_snapshot(data)
+                    prev_version = (
+                        self._snapshot.version if self._snapshot else None
+                    )
+                    self._snapshot = new_snapshot
+                    if new_snapshot.version != prev_version:
+                        for cb in self._update_listeners:
+                            try:
+                                cb()
+                            except Exception:
+                                logger.warning(
+                                    "Gradual: Update listener raised an exception",
+                                    exc_info=True,
+                                )
+                except Exception as e:
+                    logger.warning(
+                        "Gradual: Failed to parse WebSocket message: %s", e
+                    )
+        except websockets.exceptions.ConnectionClosed:
+            logger.info("Gradual: WebSocket connection closed")
+        except Exception as e:
+            logger.warning("Gradual: WebSocket error: %s", e)
+        finally:
+            # Close the socket if still open
+            if self._ws:
+                try:
+                    self._ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+            if not self._stopped:
+                self._schedule_ws_reconnect()
+
+    def _schedule_ws_reconnect(self) -> None:
+        """Schedule a WebSocket reconnection with exponential backoff."""
+        if self._stopped:
+            return
+        delay = min(2 ** self._ws_reconnect_attempt, 30)
+        self._ws_reconnect_attempt += 1
+        logger.debug("Gradual: Scheduling WebSocket reconnect in %ds", delay)
+        self._ws_reconnect_timer = threading.Timer(delay, self._ws_reconnect)
+        self._ws_reconnect_timer.daemon = True
+        self._ws_reconnect_timer.start()
+
+    def _ws_reconnect(self) -> None:
+        """Attempt to reconnect the WebSocket."""
+        if self._stopped:
+            return
+        try:
+            ws_url = self._build_ws_url()
+            ws = websockets.sync.client.connect(ws_url, open_timeout=10)
+            # Read initial snapshot on reconnect
+            raw = ws.recv(timeout=10)
+            data = json.loads(raw)
+            new_snapshot = _parse_snapshot(data)
+            prev_version = self._snapshot.version if self._snapshot else None
+            self._snapshot = new_snapshot
+            self._ws = ws
+            self._ws_reconnect_attempt = 0
+            logger.debug("Gradual: WebSocket reconnected")
+            if new_snapshot.version != prev_version:
+                for cb in self._update_listeners:
+                    try:
+                        cb()
+                    except Exception:
+                        logger.warning(
+                            "Gradual: Update listener raised an exception",
+                            exc_info=True,
+                        )
+            # Resume listening
+            self._ws_thread = threading.Thread(
+                target=self._ws_listen_loop, daemon=True
+            )
+            self._ws_thread.start()
+        except Exception as e:
+            logger.warning("Gradual: WebSocket reconnection failed: %s", e)
+            self._schedule_ws_reconnect()
+
+    def _close_ws(self) -> None:
+        """Close the WebSocket connection and cancel reconnect timer."""
+        if self._ws_reconnect_timer:
+            self._ws_reconnect_timer.cancel()
+            self._ws_reconnect_timer = None
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
     def _start_polling(self) -> None:
         if not self._polling_enabled:
             return
@@ -334,7 +486,7 @@ class GradualClient:
             except Exception as e:
                 logger.warning("Gradual: Polling refresh failed: %s", e)
             # Schedule next poll
-            if not getattr(self, "_stopped", False):
+            if not self._stopped:
                 self._polling_timer = threading.Timer(
                     self._polling_interval_ms / 1000, poll
                 )
@@ -639,7 +791,8 @@ class GradualClient:
 
     def close(self) -> None:
         """Flush pending events and stop background tasks."""
-        self._stopped = True  # type: ignore[attr-defined]
+        self._stopped = True
+        self._close_ws()
         if self._polling_timer:
             self._polling_timer.cancel()
             self._polling_timer = None
